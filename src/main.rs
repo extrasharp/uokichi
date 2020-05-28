@@ -1,7 +1,16 @@
+use std::fmt::{Debug};
 use std::mem;
 use num::{PrimInt, ToPrimitive};
 
-trait Bits: PrimInt + 'static {
+trait Bits: 'static + Debug + PrimInt + Unsigned {
+    // has to be unsigned
+    //   1. using them as bytes anyway
+    //   2. max_value is all ones
+
+    fn from_u64(val: u64) -> Self {
+       Self::from(val & Self::max_value().to_u64().unwrap()).unwrap()
+    }
+
     fn mask(ct: usize) -> Self {
         !(Self::max_value() << ct)
     }
@@ -35,9 +44,6 @@ trait Bits: PrimInt + 'static {
     }
 }
 
-// has to be unsigned
-//   1. using them as bytes
-//   2. max_value is all ones
 impl Bits for u8 {}
 impl Bits for u16 {}
 impl Bits for u32 {}
@@ -101,23 +107,56 @@ impl<T: Bits> Opdef<T> {
 //   for jumps you need to know the location of all the opdefs
 //     before you generate the code for them
 
+#[derive(Copy, Clone)]
+enum IdefType {
+    Simple,
+    Shifted,
+}
+
 struct Idef<T: Bits> {
     name: String,
-    opdefs: Vec<Opdef<T>>,
-    arg_shifts: Vec<i8>,
+    opdef: Opdef<T>,
+    typ: IdefType,
+    word_count: u8,
 }
 
 impl<T: Bits> Idef<T> {
+    fn simple(name: &str, opdef: Opdef<T>) -> Idef<T> {
+        Idef {
+            name: String::from(name),
+            opdef,
+            typ: IdefType::Simple,
+            word_count: 1,
+        }
+    }
+
+    fn shifted(name: &str, opdef: Opdef<T>) -> Idef<T> {
+        Idef {
+            name: String::from(name),
+            opdef,
+            typ: IdefType::Shifted,
+            word_count: 2,
+        }
+    }
+
     fn apply(&self, args: &[u64]) -> Vec<T> {
-        let args: Vec<T> = args.iter()
-                               .zip(self.arg_shifts.iter())
-                               .map(| pair | {
-                                   T::from((pair.0 << pair.1)
-                                           & T::max_value().to_u64().unwrap())
-                                       .unwrap()
-                               })
-                       .collect();
-        vec![self.opdefs[0].apply(&args); 1]
+        match self.typ {
+            IdefType::Simple => {
+                let args: Vec<T> = args.iter()
+                                       .map(| &arg | T::from_u64(arg))
+                                       .collect();
+                let mut ret = Vec::new();
+                ret.push(self.opdef.apply(&args));
+                ret
+            },
+            IdefType::Shifted => {
+                let arg = args[0];
+                let mut ret = Vec::new();
+                ret.push(self.opdef.apply(&[T::from_u64(arg >> mem::size_of::<T>() * 8)]));
+                ret.push(T::from_u64(arg));
+                ret
+            },
+        }
     }
 }
 
@@ -136,236 +175,6 @@ struct Instruction<T: Bits> {
     args: Vec<IArg>,
 }
 
-
-// could supply args with a function ptr
-// Fn(ctx) -> arg: u32
-//   ctx has like curr add and label table
-
-/*
-struct Context {
-}
-
-enum OpArg {
-    Flat(u32)
-    Closure {
-      Fn() -> u32,
-    }
-}
-
-struct Opcode {
-    def: OpDef
-    arg: OpArg
-}
-
-*/
-/*
-
-enum Applier<T> {
-    Simple(opd: Opdef<T>),
-}
-
-struct IDef<T: Bits> {
-    name: String,
-    arg_count: u32,
-    word_count: u32,
-    applier: Applier,
-}
-
-impl<T: Bits, U: Apply> for IDef<T, U> {
-    fn name(&self) -> &String {
-        &self.name
-    }
-
-    fn arg_count(&self) -> u32 {
-        self.arg_count
-    }
-
-    fn word_count(&self) -> u32 {
-        self.word_count
-    }
-
-    fn apply(&self, args: &[u32]) -> Vec<T> {
-        self.apply_data.apply()
-    }
-}
-*/
-/*
-
-struct IDef<T: Bits> {
-    name: String,
-    arg_count: u32,
-    word_count: u32,
-    apply_fn: Box<dyn FnOnce(&[u32]) -> Vec<T>>
-}
-
-impl<T: Bits> IDef<T> {
-    fn simple(name: &str, opd: Opdef<T>) -> IDef<T> {
-        IDef {
-            name: String::from(name),
-            arg_count: opd.arg_count(),
-            word_count: 1,
-            apply_fn: Box::new(| args: &[u32] | -> Vec<T> {
-                let opd = opd;
-                let args: Vec<T> = args.iter()
-                                       .map(| arg | T::from(*arg).unwrap())
-                                       .collect();
-                vec![opd.apply(&args); 1]
-            })
-        }
-    }
-    fn name(&self) -> &String {
-
-        &self.name
-    }
-
-    fn arg_count(&self) -> u32 {
-        self.arg_count
-    }
-
-    fn word_count(&self) -> u32 {
-        self.word_count
-    }
-
-    fn apply(&self, args: &[u32]) -> Vec<T> {
-        (&self.apply_fn)(args)
-    }
-}
-*/
-
-//
-
-/*
-trait IDef<T: Bits> {
-    fn name(&self) -> &String;
-    fn arg_count(&self) -> u32;
-    fn word_count(&self) -> u32;
-    fn apply(&self, args: &[T]) -> Vec<T>;
-}
-
-struct SimpleIDef<T: Bits> {
-    name: String,
-    arg_count: u32,
-    word_count: u32,
-    opd: Opdef<T>,
-}
-
-impl<T: Bits> SimpleIDef<T> {
-    fn new(name: &str, opd: Opdef<T>) -> SimpleIDef<T> {
-        SimpleIDef {
-            name: String::from(name),
-            arg_count: opd.arg_count(),
-            word_count: 1,
-            opd,
-        }
-    }
-}
-
-impl<T: Bits> IDef<T> for SimpleIDef<T> {
-    fn name(&self) -> &String {
-        &self.name
-    }
-
-    fn arg_count(&self) -> u32 {
-        self.arg_count
-    }
-
-    fn word_count(&self) -> u32 {
-        self.word_count
-    }
-
-    fn apply(&self, args: &[T]) -> Vec<T> {
-        vec![self.opd.apply(args); 1]
-    }
-}
-
-struct MultipleIDef<T: Bits> {
-    name: String,
-    arg_count: u32,
-    word_count: u32,
-    opds: Vec<Opdef<T>>,
-}
-
-impl<T: Bits> MultipleIDef<T> {
-    fn new(name: &str, opds: Vec<Opdef<T>>) -> MultipleIDef<T> {
-        MultipleIDef {
-            name: String::from(name),
-            arg_count: opds.iter()
-                       .fold(0, | acc, opd | acc + opd.arg_count()),
-            word_count: opds.len() as u32,
-            opds,
-        }
-    }
-}
-
-impl<T: Bits> IDef<T> for MultipleIDef<T> {
-    fn name(&self) -> &String {
-        &self.name
-    }
-
-    fn arg_count(&self) -> u32 {
-        self.arg_count
-    }
-
-    fn word_count(&self) -> u32 {
-        self.word_count
-    }
-
-    fn apply(&self, args: &[T]) -> Vec<T> {
-        // TODO
-        let mut ret = Vec::<T>::new();
-        // ret.push(self.opd.apply(args));
-        ret
-    }
-}
-
-struct ShiftedIDef<T: Bits> {
-    name: String,
-    arg_count: u32,
-    word_count: u32,
-    opd: Opdef<T>,
-    size: u32,
-}
-
-impl<T: Bits> ShiftedIDef<T> {
-    fn new(name: &str, opd: Opdef<T>, size: u32) -> ShiftedIDef<T> {
-        ShiftedIDef {
-            name: String::from(name),
-            arg_count: 1,
-            word_count: 2,
-            opd,
-            size,
-        }
-    }
-}
-
-impl<T: Bits> IDef<T> for ShiftedIDef<T> {
-    fn name(&self) -> &String {
-        &self.name
-    }
-
-    fn arg_count(&self) -> u32 {
-        self.arg_count
-    }
-
-    fn word_count(&self) -> u32 {
-        self.word_count
-    }
-
-    // note: args need to be longer then T
-    // being a u32 or u64 is fine
-    fn apply(&self, args: &[T]) -> Vec<T> {
-        let mut ret = Vec::<T>::new();
-        // ret.push(self.opd.apply(args));
-        ret
-    }
-}
-
-struct Instruction<T, U: IDef> {
-    idef: U,
-    // args:
-}
-*/
-
 fn main() {
     // let k: u32 = 0b01010011.eat(0b0101);
     // let k = u8::mask(3);
@@ -379,12 +188,10 @@ fn main() {
     // println!("{:08b}", opd.apply(&[0b01, 0b11]));
     // println!("{:08b}", opd.apply(&[0b10, 0b00]));
 
-    // let idef = IDef::simple("add", Opdef::<u8>::new("1010aabb", "ab"));
-    let idef_add = Idef {
-        name: String::from("add"),
-        opdefs: vec![Opdef::<u8>::new("aabb1100", "ab")],
-        arg_shifts: vec![0; 2]
-    };
+    let idef_add = Idef::simple("add", Opdef::<u8>::new("0011aabb", "ab"));
+    let idef_jmp = Idef::shifted("jmp", Opdef::<u8>::new("0011aaaa", "a"));
 
-    println!("{:08b}", idef_add.apply(&[0b10, 0b11])[0])
+    println!("{:08b}", idef_add.apply(&[0b10, 0b11])[0]);
+    let vals = idef_jmp.apply(&[0b0000100011001110]);
+    println!("{:08b} {:08b}", vals[0], vals[1]);
 }
