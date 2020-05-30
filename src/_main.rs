@@ -39,38 +39,37 @@ trait Bits: Debug + PrimInt + Unsigned {
     fn to_bytes(mut self, ct: usize) -> Vec<u8>
     where
         Self: ToPrimitive {
-        let mut ret = Vec::new();
-        ret.reserve(ct);
-        for _ in 0..ct {
-            ret.push((self & Self::from(0xff).unwrap()).to_u8().unwrap());
+        let mut ret = vec![0; ct];
+        for i in (0..ct).rev() {
+            ret[i] = (self & Self::from(0xff).unwrap()).to_u8().unwrap();
             self = self >> 8;
         }
         ret
     }
 }
 
-// impl Bits for u8 {}
-// impl Bits for u16 {}
-// impl Bits for u32 {}
+impl Bits for u8 {}
+impl Bits for u16 {}
+impl Bits for u32 {}
 impl Bits for u64 {}
 
 //
 
 #[derive(Debug)]
-struct Opdef {
-    base: u64,
-    args: Vec<u64>,
+struct Opdef<T: Bits> {
+    base: T,
+    args: Vec<T>
 }
 
-impl Opdef {
+impl<T: Bits> Opdef<T> {
     fn new(spec_str: &str, arg_order: &str) -> Self {
         let spec_bytes = spec_str.as_bytes();
         let arg_bytes = arg_order.as_bytes();
 
         let base = spec_bytes.iter()
-            .fold(0, | acc, byte | {
+            .fold(T::zero(), | acc, byte | {
                 if *byte == '1' as u8 {
-                    (acc << 1) | 1
+                    (acc << 1) | T::one()
                 } else {
                     acc << 1
                 }
@@ -79,9 +78,9 @@ impl Opdef {
         let args = arg_bytes.iter()
             .map(| arg_byte | {
                 spec_bytes.iter()
-                    .fold(0, | acc, spec_byte | {
+                    .fold(T::zero(), | acc, spec_byte | {
                         if *arg_byte == *spec_byte {
-                            (acc << 1) | 1
+                            (acc << 1) | T::one()
                         } else {
                             acc << 1
                         }
@@ -95,12 +94,16 @@ impl Opdef {
         }
     }
 
-    fn apply(&self, arg_vals: &[u64]) -> u64 {
+    fn apply(&self, arg_vals: &[T]) -> T {
         // TODO check arg_vals and args same len
         arg_vals.iter()
             .zip(self.args.iter())
-            .map(| (&arg, &mask) | mask.eat(arg))
+            .map(| pair | (*pair.1).eat(*pair.0))
             .fold(self.base, | acc, x | acc | x)
+    }
+
+    fn arg_count(&self) -> u32 {
+        self.args.len() as u32
     }
 }
 
@@ -109,18 +112,21 @@ impl Opdef {
 //     before you generate the code for them
 
 #[derive(Debug)]
-struct Idef {
+struct Idef<T: Bits> {
     name: String,
-    opdef: Opdef,
-    shift: i32,
+    opdef: Opdef<T>,
+    shifted: bool,
 }
 
-impl Idef {
-    fn apply(&self, args: &[u64]) -> u64 {
-        if self.shift == 0 {
+impl<T: Bits> Idef<T> {
+    fn apply(&self, args: &[u64]) -> T {
+        if self.shifted {
+            let args: Vec<T> = args.iter()
+                                   .map(| &arg | T::from_u64(arg))
+                                   .collect();
             self.opdef.apply(&args)
         } else {
-            let arg = args[0] >> self.shift;
+            let arg = T::from_u64(args[0] >> mem::size_of::<T>() * 8);
             self.opdef.apply(&[arg])
         }
     }
@@ -191,14 +197,27 @@ enum IArg {
 }
 
 #[derive(Debug)]
-enum CodeObject<'a> {
-    Instruction {
-        idef: &'a Idef,
-        args: Vec<IArg>,
-    },
-    RawData(u64),
-    AddressTag(u64),
-    LabelTag(String),
+struct Instruction<'a, T: Bits> {
+    idef: &'a Idef<T>,
+    args: Vec<IArg>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct AddressTag<A: Bits> {
+    addr: A
+}
+
+#[derive(Debug)]
+struct LabelTag {
+    name: String,
+}
+
+#[derive(Debug)]
+enum CodeObject<'a, T: Bits, A: Bits> {
+    Instruction(Instruction<'a, T>),
+    RawData(T),
+    AddressTag(AddressTag<A>),
+    LabelTag(LabelTag),
 }
 
 //
@@ -216,28 +235,19 @@ enum CompileError {
 }
 
 #[derive(Debug)]
-struct CodeInfo {
-    opcode_size: u8,
-    address_size: u8,
-}
-
-#[derive(Debug)]
-struct Code<'a> {
-    info: CodeInfo,
-    code: Vec<CodeObject<'a>>,
-    addr_image: Vec<u64>,
-    label_table: HashMap<String, u64>,
+struct Code<'a, T: Bits, A: Bits> {
+    code: Vec<CodeObject<'a, T, A>>,
+    addr_image: Vec<A>,
+    label_table: HashMap<String, A>,
 }
 
 // TODO check that code.len() doesnt wrapover type of A
 //       for the A::from(i).unwrap()
-impl<'a> Code<'a> {
-    fn new(info: CodeInfo, code: Vec<CodeObject<'a>>) -> Result<Self, CompileError> {
-        use CodeObject::*;
-
-        let mut offset =
-            if let AddressTag(addr) = code[0] {
-                addr
+impl<'a, T: Bits, A: Bits> Code<'a, T, A> {
+    fn new(code: Vec<CodeObject<'a, T, A>>) -> Result<Code<'a, T, A>, CompileError> {
+        let mut offset: A =
+            if let CodeObject::AddressTag(addr_tag) = code[0] {
+                addr_tag.addr
             } else {
                 return Err(CompileError::StartWithAddressTag);
             };
@@ -246,13 +256,13 @@ impl<'a> Code<'a> {
         addr_image.reserve(code.len());
 
         for i in 0..code.len() {
-            addr_image.push(offset);
+            addr_image.push(A::from(offset).unwrap());
             match code[i] {
-                AddressTag(addr) => {
-                    offset = addr;
+                CodeObject::AddressTag(addr_tag) => {
+                    offset = addr_tag.addr;
                 },
-                RawData(_) | Instruction{..} => {
-                    offset += 1;
+                CodeObject::RawData(_) | CodeObject::Instruction(_) => {
+                    offset = offset + A::one();
                 },
                 _ => {}
             }
@@ -262,16 +272,15 @@ impl<'a> Code<'a> {
         let mut label_table = HashMap::new();
 
         for (&addr, obj) in addr_image.iter().zip(code.iter()) {
-            if let LabelTag(label) = obj {
-                if label_table.contains_key(label) {
-                    return Err(CompileError::DuplicateLabel(label.clone()));
+            if let CodeObject::LabelTag(label_tag) = obj {
+                if label_table.contains_key(&label_tag.name) {
+                    return Err(CompileError::DuplicateLabel(label_tag.name.clone()));
                 }
-                label_table.insert(label.clone(), addr);
+                label_table.insert(label_tag.name.clone(), addr);
             }
         }
 
         Ok(Code {
-            info,
             code,
             addr_image,
             label_table,
@@ -296,36 +305,34 @@ fn main() {
 
     let idef_add = Idef {
         name: "add".to_string(),
-        opdef: Opdef::new("0011aabb", "ab"),
-        shift: 0,
-    };
+        opdef: Opdef::<u8>::new("0011aabb", "ab"),
+        shifted: false,
 
+    };
     let idef_jmp = Idef {
         name: "jmp".to_string(),
-        opdef: Opdef::new("0011aaaa", "a"),
-        shift: 8,
+        opdef: Opdef::<u8>::new("0011aaaa", "a"),
+        shifted: true,
     };
 
-    let c = Code::new(CodeInfo{opcode_size: 8, address_size: 16},
-        vec![
-            CodeObject::AddressTag(0),
-            CodeObject::LabelTag("start".to_string()),
-            CodeObject::Instruction{idef: &idef_add, args: vec![IArg::Raw(0b11), IArg::Raw(0b00)]},
-            CodeObject::Instruction{idef: &idef_jmp, args: vec![IArg::Raw(0xdead)]},
-            CodeObject::RawData(0xad),
-        ]);
+    let c = Code::new(vec![
+        CodeObject::AddressTag(AddressTag{addr: 0u16}),
+        CodeObject::LabelTag(LabelTag{name: "start".to_string()}),
+        CodeObject::Instruction(Instruction{idef: &idef_add, args: vec![IArg::Raw(0b11), IArg::Raw(0b00)]}),
+        CodeObject::Instruction(Instruction{idef: &idef_jmp, args: vec![IArg::Raw(0xdead)]}),
+        CodeObject::RawData(0xad),
+    ]);
 
     println!("{:?}", c);
 
-    let c = Code::new(CodeInfo{opcode_size: 8, address_size: 16},
-        vec![
-            CodeObject::AddressTag(0),
-            CodeObject::LabelTag("start".to_string()),
-            CodeObject::Instruction{idef: &idef_add, args: vec![IArg::Raw(0b11), IArg::Raw(0b00)]},
-            CodeObject::Instruction{idef: &idef_jmp, args: vec![IArg::Raw(0xdead)]},
-            CodeObject::LabelTag("another".to_string()),
-            CodeObject::RawData(0xad),
-        ]);
+    let c = Code::new(vec![
+        CodeObject::AddressTag(AddressTag{addr: 0u16}),
+        CodeObject::LabelTag(LabelTag{name: "start".to_string()}),
+        CodeObject::Instruction(Instruction{idef: &idef_add, args: vec![IArg::Raw(0b11), IArg::Raw(0b00)]}),
+        CodeObject::Instruction(Instruction{idef: &idef_jmp, args: vec![IArg::Raw(0xdead)]}),
+        CodeObject::LabelTag(LabelTag{name: "another".to_string()}),
+        CodeObject::RawData(0xad),
+    ]);
 
     println!("{:?}", c);
 
