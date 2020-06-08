@@ -39,10 +39,9 @@ trait Bits: Debug + PrimInt + Unsigned {
     fn to_bytes(mut self, ct: usize) -> Vec<u8>
     where
         Self: ToPrimitive {
-        let mut ret = Vec::new();
-        ret.reserve(ct);
-        for _ in 0..ct {
-            ret.push((self & Self::from(0xff).unwrap()).to_u8().unwrap());
+        let mut ret = vec![0u8; ct];
+        for i in (0..ct).rev() {
+            ret[i] = (self & Self::from(0xff).unwrap()).to_u8().unwrap();
             self = self >> 8;
         }
         ret
@@ -156,10 +155,10 @@ impl HexRecord {
 
 impl Display for HexRecord {
     fn fmt(&self, f: &mut fmt::Formatter)-> fmt::Result {
-        write!(f, ":{:02x}{:04x}{:02x}"
-             , self.data.len() & 0xff
-             , self.addr
-             , self.typ as u8)?;
+        write!(f, ":{:02x}{:04x}{:02x}",
+               self.data.len() & 0xff,
+               self.addr,
+               self.typ as u8)?;
         for byte in &self.data {
             write!(f, "{:02x}", *byte)?;
         }
@@ -169,11 +168,7 @@ impl Display for HexRecord {
 
 //
 
-// instructions are used because
-//   for jumps you need to know the location of all the opdefs
-//     before you generate the code for them
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum IArg {
     Raw(u64),
     LabelAccess {
@@ -184,7 +179,7 @@ enum IArg {
 }
 
 impl IArg {
-    fn resolve(&self, label_table: &HashMap<String, u64>, addr: u64) -> Result<u64, CompileError> {
+    fn resolve(&self, addr: u64, label_table: &HashMap<String, u64>) -> Result<u64, CompileError> {
         match self {
             IArg::Raw(val) => Ok(*val),
             IArg::LabelAccess {
@@ -210,37 +205,27 @@ impl IArg {
 }
 
 #[derive(Debug)]
+struct Instruction<'a> {
+    opdef: &'a Opdef,
+    args: Vec<IArg>,
+}
+
+//
+
+#[derive(Debug)]
 enum CodeObject<'a> {
-    Instruction {
-        opdef: &'a Opdef,
-        args: Vec<IArg>,
-    },
-    RawData(u64),
+    Instruction(Instruction<'a>),
     AddressTag(u64),
     LabelTag(String),
 }
 
-fn generate_address_image(code_objs: &[CodeObject], mut offset: u64) -> Vec<u64> {
-    use CodeObject::*;
-
-    let mut addr_image = Vec::new();
-    addr_image.reserve(code_objs.len());
-
-    for i in 0..code_objs.len() {
-        addr_image.push(offset);
-        match code_objs[i] {
-            AddressTag(addr)             => offset = addr,
-            RawData(_) | Instruction{..} => offset += 1,
-            _ => {}
-        }
-    }
-
-    addr_image
+#[derive(Debug)]
+enum HexObject {
+    AddressTag(u64),
+    Opcode(u64),
 }
 
-
-//
-
+// todo default
 #[derive(Clone, Debug)]
 struct CompileSettings {
     opcode_size: u8,
@@ -256,135 +241,142 @@ enum CompileError {
     LabelNotFound(String),
 }
 
-#[derive(Debug)]
-struct Code<'a> {
-    code: Vec<CodeObject<'a>>,
-    settings: CompileSettings,
-    addr_image: Vec<u64>,
-    label_table: HashMap<String, u64>,
+fn generate_address_image(code: &[CodeObject]) -> Result<Vec<u64>, CompileError> {
+    use CodeObject::*;
+
+    let mut offset =
+        if let AddressTag(addr) = code[0] {
+            addr
+        } else {
+            return Err(CompileError::StartWithAddressTag);
+        };
+
+    let mut addr_image = Vec::new();
+    addr_image.reserve(code.len());
+
+    for obj in code.iter() {
+        addr_image.push(offset);
+        match obj {
+            AddressTag(addr) => offset = *addr,
+            Instruction{..}  => offset += 1,
+            _ => {}
+        }
+    }
+
+    Ok(addr_image)
 }
 
-// TODO check that code.len() doesnt wrapover type of A
-//       for the A::from(i).unwrap()
-impl<'a> Code<'a> {
-    fn new(settings: CompileSettings, code: Vec<CodeObject<'a>>) -> Result<Self, CompileError> {
-        use CodeObject::*;
+fn generate_label_table(code: &[CodeObject], address_image: &[u64]) -> Result<HashMap<String, u64>, CompileError> {
+    use CodeObject::*;
 
-        let offset =
-            if let AddressTag(addr) = code[0] {
-                addr
-            } else {
-                return Err(CompileError::StartWithAddressTag);
-            };
+    let mut label_table = HashMap::new();
 
-        let addr_image = generate_address_image(&code, offset);
-        let mut label_table = HashMap::new();
-
-        for (&addr, obj) in addr_image.iter().zip(code.iter()) {
-            if let LabelTag(label) = obj {
+    for (obj, addr) in code.iter().zip(address_image.iter()) {
+        match obj {
+            LabelTag(label) => {
+                let name = label.clone();
                 if label_table.contains_key(label) {
-                    return Err(CompileError::DuplicateLabel(label.clone()));
+                    return Err(CompileError::DuplicateLabel(name));
+                } else {
+                    label_table.insert(name, *addr);
                 }
-                label_table.insert(label.clone(), addr);
             }
+            _ => {}
         }
-
-        Ok(Code {
-            code,
-            settings,
-            addr_image,
-            label_table,
-        })
     }
 
-    fn to_opcodes(&self) -> Result<Vec<u64>, CompileError> {
-        use CodeObject::*;
+    Ok(label_table)
+}
 
-        let ret: Result<Vec<_>, _> =
-            self.addr_image.iter()
-                           .zip(self.code.iter())
-                           .filter_map(| (&addr, obj) | {
-                               match obj {
-                                   RawData(val) => Some(Ok(*val)),
-                                   Instruction {
-                                       opdef,
-                                       args
-                                   } => {
-                                       let resolved: Result<Vec<_>, _> =
-                                           args.iter()
-                                               .map(| arg | arg.resolve(&self.label_table, addr))
-                                               .collect();
-                                       match resolved {
-                                           Ok(r_args) => Some(Ok(opdef.apply(&r_args))),
-                                           Err(err) => Some(Err(err))
-                                       }
-                                   },
-                                   _ => None
-                               }
-                           })
-                           .collect();
+fn generate_hex_objects(
+    code: &[CodeObject],
+    address_image: &[u64],
+    label_table: &HashMap<String, u64>
+) -> Result<Vec<HexObject>, CompileError> {
+    use CodeObject::*;
 
-        ret
-
-        /*
-        for (&addr, obj) in self.addr_image.iter().zip(self.code.iter()) {
+    code.iter()
+        .zip(address_image.iter())
+        .filter(| (obj, _) | !matches!(obj, LabelTag(_)))
+        .map(| (obj, &addr) | {
             match obj {
-                RawData(val) => ret.push(*val),
-                Instruction{ opdef, args } => {
-                    let mut resolved_args: Vec<u64> = Vec::new();
-                    resolved_args.reserve(args.len());
-
-                    for iarg in args {
-                        match iarg {
-                            IArg::Raw(val) => resolved_args.push(*val),
-                            IArg::LabelAccess{name, is_relative, offset} => {
-                                match self.label_table.get(name) {
-                                    Some(label_addr) => {
-                                        if *is_relative {
-                                            // TODO check this works
-                                            resolved_args.push((*label_addr as i32
-                                                                - addr as i32
-                                                                + *offset) as u64);
-                                        } else {
-                                            resolved_args.push(*label_addr);
-                                        }
-                                    },
-                                    None => return Err(CompileError::LabelNotFound(name.clone())),
-                                }
-                            }
-                        }
+                AddressTag(tag_addr) => Ok(HexObject::AddressTag(*tag_addr)),
+                Instruction(inst)    => {
+                    let args: Result<Vec<_>, _> =
+                        inst.args.iter()
+                                 .map(| arg | arg.resolve(addr, &label_table))
+                                 .collect();
+                    match args {
+                        Ok(args) => Ok(HexObject::Opcode(inst.opdef.apply(&args))),
+                        Err(err) => Err(err),
                     }
-
-                    ret.push(opdef.apply(&resolved_args));
-                },
-                _ => {}
+                }
+                _ => unreachable!(),
             }
+        })
+        .collect()
+}
+
+fn generate_hex_records(hex_objects: &[HexObject], settings: &CompileSettings) -> Result<Vec<HexRecord>, CompileError> {
+    let mut records = Vec::new();
+
+    let i_addresses = hex_objects.iter()
+                                 .filter_map(| obj | {
+                                     if let HexObject::AddressTag(addr) = obj {
+                                         Some(addr)
+                                     } else {
+                                         None
+                                     }
+                                 });
+
+    let i_splits = hex_objects.split(| obj | matches!(obj, HexObject::AddressTag(_)));
+
+    // TODO
+    // note, i_splits skips the first one
+    for (split_addr, split) in i_addresses.zip(i_splits.skip(1)) {
+        let i_chunks = split.chunks(settings.words_per_record as usize);
+        for (chunk_addr, chunk) in i_chunks.enumerate() {
+            records.push(HexRecord {
+                typ: HexRecordType::Data,
+                // TODO check somehow?
+                addr: (split_addr + (chunk_addr * settings.words_per_record as usize) as u64) as u16,
+                data: chunk.iter()
+                           .flat_map(| obj | {
+                               let opcode =
+                                   match obj {
+                                       HexObject::Opcode(val) => val,
+                                       _ => unreachable!(),
+                                   };
+
+                               opcode.to_bytes(settings.opcode_size as usize)
+                           })
+                           .collect(),
+            });
         }
-        */
     }
+
+    records.push(settings.eof_record.clone());
+
+    Ok(records)
+}
+
+fn compile(settings: CompileSettings, code: Vec<CodeObject>) -> Result<Vec<HexRecord>, CompileError> {
+    let address_image = generate_address_image(&code)?;
+    let label_table = generate_label_table(&code, &address_image)?;
+    let hex_objects = generate_hex_objects(&code, &address_image, &label_table)?;
+    generate_hex_records(&hex_objects, &settings)
 }
 
 //
 
 fn main() {
-    // let k: u32 = 0b01010011.eat(0b0101);
-    // let k = u8::mask(3);
-    // let f = 0xdeadbeefu32.to_bytes(8);
-    // println!("0b{:08b}", k);
-    // println!("{:?}", f);
-    // println!("{} {} {} {}", 0xde, 0xad, 0xbe, 0xef);
-
-    // let opd = Opdef::<u8>::new("0101aabb", "ab");
-    // println!("{:08b}", opd.apply(&[0b11, 0b01]));
-    // println!("{:08b}", opd.apply(&[0b01, 0b11]));
-    // println!("{:08b}", opd.apply(&[0b10, 0b00]));
-
     let opdef_add = Opdef::new("add", "0011aabb", "ab", 0);
     let opdef_jmp = Opdef::new("jmp", "1100aaaa", "a", 8);
+    let opdef_direct = Opdef::new("direct", "aaaaaaaa", "a", 0);
 
     let settings = CompileSettings {
-        opcode_size: 8,
-        address_size: 16,
+        opcode_size: 2,
+        address_size: 2,
         eof_record: HexRecord {
             typ: HexRecordType::EndOfFile,
             data: Vec::new(),
@@ -393,43 +385,34 @@ fn main() {
         words_per_record: 10
     };
 
-    let c = Code::new(settings.clone(),
-        vec![
-            CodeObject::AddressTag(0),
-            CodeObject::LabelTag("start".to_string()),
-            CodeObject::Instruction{opdef: &opdef_add, args: vec![IArg::Raw(0b11), IArg::Raw(0b00)]},
-            CodeObject::Instruction{opdef: &opdef_jmp, args: vec![IArg::Raw(0xdead)]},
-            CodeObject::RawData(0xad),
-        ]);
-
-    println!("{:?}", c);
-
-    let c = Code::new(settings.clone(),
-        vec![
-            CodeObject::AddressTag(0),
-            CodeObject::LabelTag("start".to_string()),
-            CodeObject::Instruction{opdef: &opdef_add, args: vec![IArg::Raw(0b11), IArg::Raw(0b00)]},
-            CodeObject::Instruction{opdef: &opdef_jmp, args: vec![IArg::Raw(0xdead)]},
-            CodeObject::LabelTag("another".to_string()),
-            CodeObject::RawData(0xad),
-        ]);
-
-    println!("{:?}", c);
-
-    /*
-    println!("{:08b}", idef_add.apply(&[0b10, 0b11])[0]);
-    let vals = idef_jmp.apply(&[0b0000100011001110]);
-    println!("{:08b} {:08b}", vals[0], vals[1]);
-
-    let hr = HexRecord {
-        typ: HexRecordType::Data,
-        addr: 0x0030,
-        data: vec![
-            0x02,
-            0x33,
-            0x7a,
-        ]
+    let lb = IArg::LabelAccess {
+        name: "start".to_string(),
+        is_relative: false,
+        offset: 0,
     };
-    println!("{}", hr);
-    */
+
+    let c =
+        vec![
+            CodeObject::AddressTag(0xdead),
+            CodeObject::LabelTag("start".to_string()),
+            CodeObject::Instruction(Instruction { opdef: &opdef_add, args: vec![IArg::Raw(0b11), IArg::Raw(0b00)]} ),
+            CodeObject::Instruction(Instruction { opdef: &opdef_add, args: vec![IArg::Raw(0b11), IArg::Raw(0b00)]} ),
+            CodeObject::Instruction(Instruction { opdef: &opdef_add, args: vec![IArg::Raw(0b11), IArg::Raw(0b00)]} ),
+            CodeObject::Instruction(Instruction { opdef: &opdef_add, args: vec![IArg::Raw(0b11), IArg::Raw(0b00)]} ),
+            CodeObject::Instruction(Instruction { opdef: &opdef_add, args: vec![IArg::Raw(0b11), IArg::Raw(0b00)]} ),
+            CodeObject::Instruction(Instruction { opdef: &opdef_add, args: vec![IArg::Raw(0b11), IArg::Raw(0b00)]} ),
+            CodeObject::AddressTag(0xdeac),
+            CodeObject::LabelTag("another".to_string()),
+            CodeObject::Instruction(Instruction { opdef: &opdef_jmp, args: vec![lb.clone()]} ),
+            CodeObject::Instruction(Instruction { opdef: &opdef_direct, args: vec![lb]} ),
+            CodeObject::Instruction(Instruction { opdef: &opdef_jmp, args: vec![IArg::Raw(0xdead)]} ),
+            CodeObject::Instruction(Instruction { opdef: &opdef_direct, args: vec![IArg::Raw(0xdead)]} ),
+            CodeObject::Instruction(Instruction { opdef: &opdef_jmp, args: vec![IArg::Raw(0xdead)]} ),
+            CodeObject::Instruction(Instruction { opdef: &opdef_direct, args: vec![IArg::Raw(0xdead)]} ),
+        ];
+
+    let hrs = compile(settings, c).unwrap();
+    for hr in hrs {
+        println!("{}", hr);
+    }
 }
