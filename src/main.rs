@@ -69,28 +69,28 @@ impl Opdef {
         let arg_bytes = arg_order.as_bytes();
 
         let base = spec_bytes.iter()
-            .map(| &byte | byte == '1' as u8)
-            .fold(0, | acc, tf | {
-                if tf {
-                    (acc << 1) | 1
-                } else {
-                    acc << 1
-                }
-            });
+                             .map(| &byte | byte == '1' as u8)
+                             .fold(0, | acc, tf | {
+                                 if tf {
+                                     (acc << 1) | 1
+                                 } else {
+                                     acc << 1
+                                 }
+                             });
 
         let args = arg_bytes.iter()
-            .map(| &arg_byte | {
-                spec_bytes.iter()
-                    .map(| &spec_byte | arg_byte == spec_byte)
-                    .fold(0, | acc, tf | {
-                        if tf {
-                            (acc << 1) | 1
-                        } else {
-                            acc << 1
-                        }
-                    })
-            })
-            .collect();
+                            .map(| &arg_byte | {
+                                spec_bytes.iter()
+                                          .map(| &spec_byte | arg_byte == spec_byte)
+                                          .fold(0, | acc, tf | {
+                                              if tf {
+                                                  (acc << 1) | 1
+                                              } else {
+                                                  acc << 1
+                                              }
+                                          })
+                            })
+                            .collect();
 
         Opdef {
             name: name.to_string(),
@@ -104,9 +104,9 @@ impl Opdef {
         // TODO check arg_vals and args same len
         if self.shift == 0 {
             self.args.iter()
-                .zip(arg_vals.iter())
-                .map(| (&mask, &arg) | mask.eat(arg))
-                .fold(self.base, | acc, x | acc | x)
+                     .zip(arg_vals.iter())
+                     .map(| (&mask, &arg) | mask.eat(arg))
+                     .fold(self.base, | acc, x | acc | x)
         } else {
             let arg = arg_vals[0] >> self.shift;
             self.base | self.args[0].eat(arg)
@@ -258,7 +258,7 @@ fn generate_address_image(code: &[CodeObject]) -> Result<Vec<u64>, CompileError>
         addr_image.push(offset);
         match obj {
             AddressTag(addr) => offset = *addr,
-            Instruction{..}  => offset += 1,
+            Instruction(_)   => offset += 1,
             _ => {}
         }
     }
@@ -318,22 +318,27 @@ fn generate_hex_objects(
 }
 
 fn generate_hex_records(hex_objects: &[HexObject], settings: &CompileSettings) -> Result<Vec<HexRecord>, CompileError> {
+    use HexObject::*;
+
     let mut records = Vec::new();
 
     let i_addresses = hex_objects.iter()
                                  .filter_map(| obj | {
-                                     if let HexObject::AddressTag(addr) = obj {
+                                     if let AddressTag(addr) = obj {
                                          Some(addr)
                                      } else {
                                          None
                                      }
                                  });
 
-    let i_splits = hex_objects.split(| obj | matches!(obj, HexObject::AddressTag(_)));
+    // note:
+    // skips one
+    //   because hex_objects will start with an addr tag
+    //   i_splits[0] == []
+    let i_splits = hex_objects.split(| obj | matches!(obj, AddressTag(_)))
+                              .skip(1);
 
-    // TODO
-    // note, i_splits skips the first one
-    for (split_addr, split) in i_addresses.zip(i_splits.skip(1)) {
+    for (split_addr, split) in i_addresses.zip(i_splits) {
         let i_chunks = split.chunks(settings.words_per_record as usize);
         for (chunk_addr, chunk) in i_chunks.enumerate() {
             records.push(HexRecord {
@@ -344,7 +349,7 @@ fn generate_hex_records(hex_objects: &[HexObject], settings: &CompileSettings) -
                            .flat_map(| obj | {
                                let opcode =
                                    match obj {
-                                       HexObject::Opcode(val) => val,
+                                       Opcode(val) => val,
                                        _ => unreachable!(),
                                    };
 
